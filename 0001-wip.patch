@@ -1,0 +1,1280 @@
+From 529dcdc2c0e1ba9e9eaf2b95f21828da5772d1fd Mon Sep 17 00:00:00 2001
+From: Anton Gusev <uartman@mail.ru>
+Date: Sun, 14 Apr 2024 23:16:57 +0300
+Subject: [PATCH] wip
+
+---
+ include/linux/ref_dump.h |  59 +++
+ lib/Kconfig              |  41 +-
+ lib/Kconfig.debug        |   5 +
+ lib/Makefile             |   3 +
+ lib/ref_dump.c           | 789 +++++++++++++++++++++++++++++++++++++++
+ lib/test_ref_dump.c      | 277 ++++++++++++++
+ mm/kasan/report.c        |   2 +
+ 7 files changed, 1175 insertions(+), 1 deletion(-)
+ create mode 100644 include/linux/ref_dump.h
+ create mode 100644 lib/ref_dump.c
+ create mode 100644 lib/test_ref_dump.c
+
+diff --git a/include/linux/ref_dump.h b/include/linux/ref_dump.h
+new file mode 100644
+index 000000000000..d07bc65ec69e
+--- /dev/null
++++ b/include/linux/ref_dump.h
+@@ -0,0 +1,59 @@
++#ifdef CONFIG_REF_DUMP
++#include "linux/kprobes.h"
++void ref_dump_init(void);
++
++void ref_dump_register(void *addr, int offset);
++void ref_dump_delete(void *addr, int offset);
++void ref_dump_inc(void *addr, int offset);
++void ref_dump_dec(void *addr, int offset);
++
++void ref_dump_register_regs(struct pt_regs *regs, int nth_arg, int offset);
++void ref_dump_delete_regs(struct pt_regs *regs, int nth_arg, int offset);
++void ref_dump_inc_regs(struct pt_regs *regs, int nth_arg, int offset);
++void ref_dump_dec_regs(struct pt_regs *regs, int nth_arg, int offset);
++
++void ref_dump_all(void);
++void ref_dump_addr(void *addr);
++
++void ref_dump_purge(void);
++
++void ref_dump_whitelist_set_enabled(bool enable);
++void ref_dump_whitelist_addr(void *addr, bool enable);
++
++long bench_mem(void);
++void bench_reset(void);
++#else
++static inline void ref_dump_init(void)
++{
++}
++static inline void ref_dump_register(void *addr)
++{
++}
++static inline void ref_dump_delete(void *addr)
++{
++}
++static inline void ref_dump_inc(void *addr)
++{
++}
++static inline void ref_dump_dec(void *addr)
++{
++}
++static inline void ref_dump_all(void)
++{
++}
++static inline void ref_dump_addr(void *addr)
++{
++}
++static inline void ref_dump_register_regs(struct pt_regs *regs, int nth_arg)
++{
++}
++static inline void ref_dump_delete_regs(struct pt_regs *regs, int nth_arg)
++{
++}
++static inline void ref_dump_inc_regs(struct pt_regs *regs, int nth_arg)
++{
++}
++static inline void ref_dump_dec_regs(struct pt_regs *regs, int nth_arg)
++{
++}
++#endif
+diff --git a/lib/Kconfig b/lib/Kconfig
+index 5ddda7c2ed9b..62f643b4fae8 100644
+--- a/lib/Kconfig
++++ b/lib/Kconfig
+@@ -397,7 +397,7 @@ config GENERIC_ALLOCATOR
+ #
+ config REED_SOLOMON
+ 	tristate
+-	
++
+ config REED_SOLOMON_ENC8
+ 	bool
+ 
+@@ -733,6 +733,45 @@ config REF_TRACKER
+ 	depends on STACKTRACE_SUPPORT
+ 	select STACKDEPOT
+ 
++config REF_DUMP
++	bool "Reference count dump module"
++	depends on STACKTRACE_SUPPORT
++	select STACKDEPOT
++
++choice
++	prompt "Reference count associative backend"
++	depends on REF_DUMP
++	default REF_DUMP_HASHTABLE
++
++	config REF_DUMP_HASHTABLE
++		bool "Hash table backend"
++	# config REF_DUMP_RHASHTABLE
++	# 	bool "Resizeable hash table backend"
++	config REF_DUMP_RBTREE
++		bool "Red-black tree backend"
++endchoice
++
++config REF_DUMP_HASH_BITS
++	depends on REF_DUMP_HASHTABLE
++	int "Reference count dump hash table bits"
++	default 8
++	range 4 16
++
++choice
++	prompt "Reference count history backend"
++	depends on REF_DUMP
++	default REF_DUMP_RINGBUF
++
++	config REF_DUMP_DYNARR
++		bool "Dynamic array history"
++
++	config REF_DUMP_RINGBUF
++		bool "Fixed ring buffer history"
++
++	# config REF_DUMP_DYNRING
++	# 	bool "Dynamic ring buffer history"
++endchoice
++
+ config SBITMAP
+ 	bool
+ 
+diff --git a/lib/Kconfig.debug b/lib/Kconfig.debug
+index 975a07f9f1cc..2fea0746494e 100644
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@ -2293,6 +2293,11 @@ config TEST_REF_TRACKER
+ 
+ 	  Say N if you are unsure.
+ 
++config TEST_REF_DUMP
++	tristate "Self test for reference dump"
++	depends on DEBUG_KERNEL && STACKTRACE_SUPPORT
++	select REF_DUMP
++
+ config RBTREE_TEST
+ 	tristate "Red-Black tree test"
+ 	depends on DEBUG_KERNEL
+diff --git a/lib/Makefile b/lib/Makefile
+index 6b09731d8e61..b5659e374fb7 100644
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@ -105,6 +105,7 @@ obj-$(CONFIG_TEST_HMM) += test_hmm.o
+ obj-$(CONFIG_TEST_FREE_PAGES) += test_free_pages.o
+ obj-$(CONFIG_KPROBES_SANITY_TEST) += test_kprobes.o
+ obj-$(CONFIG_TEST_REF_TRACKER) += test_ref_tracker.o
++obj-$(CONFIG_TEST_REF_DUMP) += test_ref_dump.o
+ CFLAGS_test_fprobe.o += $(CC_FLAGS_FTRACE)
+ obj-$(CONFIG_FPROBE_SANITY_TEST) += test_fprobe.o
+ obj-$(CONFIG_TEST_OBJPOOL) += test_objpool.o
+@@ -295,6 +296,8 @@ KCOV_INSTRUMENT_stackdepot.o := n
+ 
+ obj-$(CONFIG_REF_TRACKER) += ref_tracker.o
+ 
++obj-$(CONFIG_REF_DUMP) += ref_dump.o
++
+ libfdt_files = fdt.o fdt_ro.o fdt_wip.o fdt_rw.o fdt_sw.o fdt_strerror.o \
+ 	       fdt_empty_tree.o fdt_addresses.o
+ $(foreach file, $(libfdt_files), \
+diff --git a/lib/ref_dump.c b/lib/ref_dump.c
+new file mode 100644
+index 000000000000..7ca6d7a16378
+--- /dev/null
++++ b/lib/ref_dump.c
+@@ -0,0 +1,789 @@
++#include "asm/bug.h"
++#include "asm/ptrace.h"
++#include "linux/array_size.h"
++#include "linux/gfp_types.h"
++#include "linux/list.h"
++#include "linux/mutex.h"
++#include "linux/mutex_types.h"
++#include "linux/printk.h"
++#include "linux/rbtree.h"
++#include "linux/rbtree_types.h"
++#include "linux/sched/clock.h"
++#include "linux/slab.h"
++#include "linux/stackdepot.h"
++#include "linux/stacktrace.h"
++#include "linux/types.h"
++#include <linux/hashtable.h>
++#include <linux/ref_dump.h>
++#include <linux/module.h>
++
++#define REF_DUMP_STACK_ENTRIES 16
++
++#define REF_DUMP_EVENT_ALLOC 1
++#define REF_DUMP_EVENT_INC 2
++#define REF_DUMP_EVENT_DEC 3
++#define REF_DUMP_EVENT_FREE 4
++
++bool whitelist_enabled = false;
++
++void ref_dump_whitelist_set_enabled(bool enable)
++{
++	whitelist_enabled = enable;
++}
++
++long memory_taken = 0;
++
++long bench_mem(void)
++{
++	return memory_taken;
++}
++
++void bench_reset(void)
++{
++	memory_taken = 0;
++}
++
++char *REF_DUMP_EVENT_TYPE_NAMES[] = { "Invalid", "Allocation", "Increment",
++				      "Decrement", "Free" };
++
++struct ref_dump_event {
++	int type;
++	depot_stack_handle_t trace;
++	u64 clock_at;
++	int current_value;
++};
++
++static struct ref_dump_event ref_dump_make_event(int type, int current_value)
++{
++	struct ref_dump_event event;
++	unsigned long entries[REF_DUMP_STACK_ENTRIES];
++	unsigned int nr_entries;
++
++	nr_entries = stack_trace_save(entries, ARRAY_SIZE(entries), 2);
++	event.type = type;
++	event.trace = stack_depot_save_flags(entries, nr_entries, GFP_KERNEL,
++					     STACK_DEPOT_FLAG_CAN_ALLOC |
++						     STACK_DEPOT_FLAG_GET);
++	event.clock_at = local_clock();
++	event.current_value = current_value;
++	return event;
++}
++
++static struct ref_dump_event
++ref_dump_make_event_regs(int type, struct pt_regs *regs, int current_value)
++{
++	struct ref_dump_event event;
++	unsigned long entries[REF_DUMP_STACK_ENTRIES];
++	unsigned int nr_entries;
++
++	nr_entries =
++		stack_trace_save_regs(regs, entries, ARRAY_SIZE(entries), 0);
++	event.type = type;
++	event.trace = stack_depot_save_flags(entries, nr_entries, GFP_KERNEL,
++					     STACK_DEPOT_FLAG_CAN_ALLOC |
++						     STACK_DEPOT_FLAG_GET);
++	event.clock_at = local_clock();
++	event.current_value = current_value;
++	return event;
++}
++
++static char *ref_dump_event_type_name(int type)
++{
++	if (type > 0 && type <= 4) {
++		return REF_DUMP_EVENT_TYPE_NAMES[type];
++	}
++	return REF_DUMP_EVENT_TYPE_NAMES[0];
++}
++
++DEFINE_MUTEX(ref_dump_mutex);
++
++#ifdef CONFIG_REF_DUMP_DYNARR
++struct ref_dump_node_info {
++	void *ptr;
++	// atomic_t rcnt;
++	struct ref_dump_event *events;
++	int events_allocated;
++	int event_count;
++};
++
++static void ref_dump_node_info_init_events(struct ref_dump_node_info *info)
++{
++	info->events = kmalloc(sizeof(struct ref_dump_event) * 8, GFP_KERNEL);
++	info->events_allocated = 8;
++	info->event_count = 0;
++	memory_taken += sizeof(struct ref_dump_event) * 8;
++}
++
++static struct ref_dump_event *
++ref_dump_node_info_add_event(struct ref_dump_node_info *info)
++{
++	if (info->events == NULL) {
++		info->events =
++			kmalloc(sizeof(struct ref_dump_event) * 8, GFP_KERNEL);
++		info->events_allocated = 8;
++		info->event_count = 0;
++		memory_taken += sizeof(struct ref_dump_event) * 8;
++	}
++	if (info->event_count == info->events_allocated) {
++		struct ref_dump_event *events =
++			krealloc(info->events,
++				 sizeof(struct ref_dump_event) *
++					 (info->events_allocated * 2),
++				 GFP_KERNEL);
++		if (events == NULL) {
++			return NULL;
++		}
++		info->events = events;
++		memory_taken +=
++			sizeof(struct ref_dump_event) * info->events_allocated;
++		info->events_allocated += info->events_allocated;
++	}
++	struct ref_dump_event *ret = &info->events[info->event_count];
++	info->event_count += 1;
++
++	return ret;
++}
++
++static void ref_dump_node_info(struct ref_dump_node_info *info)
++{
++	printk("======\nDumping history of address: %px", info->ptr);
++	for (int j = 0; j < info->event_count; j += 1) {
++		printk("Event type: %s occured at %llu.%06llu",
++		       ref_dump_event_type_name(info->events[j].type),
++		       info->events[j].clock_at / 1000000000,
++		       info->events[j].clock_at % 1000000000);
++		stack_depot_print(info->events[j].trace);
++	}
++}
++
++static void ref_dump_info_delete(struct ref_dump_node_info *info)
++{
++	for (int i = 0; i < info->event_count; i += 1) {
++		stack_depot_put(info->events[i].trace);
++	}
++	kfree(info->events);
++	memory_taken -= sizeof(struct ref_dump_event) * info->events_allocated;
++	info->events_allocated = 0;
++	info->events = NULL;
++	info->event_count = 0;
++}
++#endif
++
++#ifdef CONFIG_REF_DUMP_RINGBUF
++#define RD_DELETE_STRATEGY_EVENT
++struct ref_dump_node_info {
++	void *ptr;
++	// atomic_t rcnt;
++	struct ref_dump_event *events;
++	int starting_index;
++	int event_count;
++	bool whitelisted;
++};
++
++static void ref_dump_node_info_init_events(struct ref_dump_node_info *info)
++{
++	info->events = kmalloc(100 * sizeof(struct ref_dump_event), GFP_KERNEL);
++	info->starting_index = 0;
++	info->event_count = 0;
++	info->whitelisted = false;
++	memory_taken += 100 * sizeof(struct ref_dump_event);
++}
++
++static struct ref_dump_event *
++ref_dump_node_info_add_event(struct ref_dump_node_info *info)
++{
++	if ((!(info->whitelisted)) && whitelist_enabled) {
++		return NULL;
++	}
++	if (info->events == NULL) {
++		ref_dump_node_info_init_events(info);
++	}
++	if (info->event_count == 100) {
++		info->starting_index = (info->starting_index + 1) % 100;
++		return &info->events[info->event_count % 100];
++	} else {
++		struct ref_dump_event *ret =
++			&info->events[info->event_count % 100];
++		info->event_count = info->event_count + 1;
++		return ret;
++	}
++}
++
++static void ref_dump_node_info(struct ref_dump_node_info *info)
++{
++	if (info->event_count == 0)
++		return;
++	printk("==================\nDumping history of address: %px",
++	       info->ptr);
++	for (int j = 0; j < info->event_count; j += 1) {
++		printk("Event type: %s occured at %llu.%06llu. Value afterwards: %i.",
++		       ref_dump_event_type_name(
++			       info->events[(info->starting_index + j) % 100]
++				       .type),
++		       info->events[j].clock_at / 1000000000,
++		       info->events[j].clock_at % 1000000000,
++		       info->events[j].current_value);
++		stack_depot_print(
++			info->events[(info->starting_index + j) % 100].trace);
++	}
++}
++
++static void ref_dump_info_delete(struct ref_dump_node_info *info)
++{
++	for (int i = 0; i < info->event_count; i += 1) {
++		stack_depot_put(
++			info->events[(info->starting_index + i) % 100].trace);
++	}
++	kfree(info->events);
++	memory_taken -= 100 * sizeof(struct ref_dump_event);
++	info->event_count = 0;
++	info->events = NULL;
++	info->event_count = 0;
++}
++#endif
++
++#ifdef CONFIG_REF_DUMP_LINKEDLIST
++#define RD_DELETE_STRATEGY_EVENT
++
++struct ref_dump_node_info {
++	void *ptr;
++	// atomic_t rcnt;
++	struct ref_dump_event *events;
++	int starting_index;
++	int event_count;
++};
++
++static void ref_dump_node_info_init_events(struct ref_dump_node_info *info)
++{
++}
++
++static struct ref_dump_event *
++ref_dump_node_info_add_event(struct ref_dump_node_info *info)
++{
++}
++
++static void ref_dump_node_info(struct ref_dump_node_info *info)
++{
++	// printk("======\nDumping history of address: %px", info->ptr);
++	// for (int j = 0; j < info->event_count; j += 1) {
++	// 	printk("Event type: %s occured at %llu.%06llu",
++	// 	       ref_dump_event_type_name(info->events[(info->starting_index + j) % 100].type),
++	// 	       info->events[j].clock_at / 1000000000,
++	// 	       info->events[j].clock_at % 1000000000);
++	// 	stack_depot_print(info->events[(info->starting_index + j) % 100].trace);
++	// }
++}
++
++static void ref_dump_info_delete(struct ref_dump_node_info *info)
++{
++}
++
++#endif
++
++#ifdef CONFIG_REF_DUMP_HASHTABLE
++
++DECLARE_HASHTABLE(ref_dump_hashtable, CONFIG_REF_DUMP_HASH_BITS);
++
++struct ref_dump_node {
++	struct hlist_node node;
++	struct ref_dump_node_info info;
++};
++
++static void ref_dump_node_init_events(struct ref_dump_node *node)
++{
++	ref_dump_node_info_init_events(&node->info);
++}
++
++static struct ref_dump_event *
++ref_dump_node_add_event(struct ref_dump_node *node)
++{
++	return ref_dump_node_info_add_event(&node->info);
++}
++
++// Call only when locked!
++static struct ref_dump_node *ref_dump_find(void *addr)
++{
++	size_t hash = hash_min((u64)addr, CONFIG_REF_DUMP_HASH_BITS);
++	struct hlist_node *tmp;
++	struct ref_dump_node *cursor;
++	hlist_for_each_entry_safe(cursor, tmp, &ref_dump_hashtable[hash],
++				  node) {
++		if (cursor->info.ptr == addr) {
++			return cursor;
++		}
++	}
++	return NULL;
++}
++
++static struct ref_dump_node *ref_dump_create_and_add(void *addr)
++{
++	struct ref_dump_node *res =
++		kmalloc(sizeof(struct ref_dump_node), GFP_KERNEL);
++	if (res == NULL)
++		return NULL;
++	ref_dump_node_init_events(res);
++	hash_add(ref_dump_hashtable, &res->node, (u64)addr);
++	return res;
++}
++
++// Call only when locked!
++static struct ref_dump_node *ref_dump_find_or_create(void *addr)
++{
++	struct ref_dump_node *res = ref_dump_find(addr);
++	if (res)
++		return res;
++	return ref_dump_create_and_add(addr);
++}
++
++void ref_dump_init(void)
++{
++	stack_depot_init();
++	mutex_init(&ref_dump_mutex);
++	mutex_lock(&ref_dump_mutex);
++	hash_init(ref_dump_hashtable);
++	mutex_unlock(&ref_dump_mutex);
++}
++
++void ref_dump_register(void *addr)
++{
++	struct ref_dump_event event = ref_dump_make_event(REF_DUMP_EVENT_ALLOC);
++	struct ref_dump_event *event_target;
++
++	mutex_lock(&ref_dump_mutex);
++	struct ref_dump_node *new_node = ref_dump_find_or_create(addr);
++
++	if (new_node) {
++		new_node->info.ptr = addr;
++		event_target = ref_dump_node_add_event(new_node);
++		*event_target = event;
++	}
++
++	mutex_unlock(&ref_dump_mutex);
++}
++
++void ref_dump_register_regs(struct pt_regs *regs, int nth_arg)
++{
++	struct ref_dump_event event =
++		ref_dump_make_event_regs(REF_DUMP_EVENT_ALLOC, regs);
++	struct ref_dump_event *event_target;
++
++	void *addr = (void *)regs_get_kernel_argument(regs, nth_arg);
++
++	mutex_lock(&ref_dump_mutex);
++	struct ref_dump_node *new_node = ref_dump_find_or_create(addr);
++
++	if (new_node) {
++		new_node->info.ptr = addr;
++		event_target = ref_dump_node_add_event(new_node);
++		*event_target = event;
++	}
++
++	mutex_unlock(&ref_dump_mutex);
++}
++
++void ref_dump_delete(void *addr)
++{
++	struct ref_dump_node *cursor;
++	mutex_lock(&ref_dump_mutex);
++	cursor = ref_dump_find(addr);
++	if (cursor) {
++		ref_dump_info_delete(&cursor->info);
++		hash_del(&cursor->node);
++	}
++	mutex_unlock(&ref_dump_mutex);
++}
++
++void ref_dump_delete_regs(struct pt_regs *regs, int nth_arg)
++{
++	void *addr = (void *)regs_get_kernel_argument(regs, nth_arg);
++	struct ref_dump_node *cursor;
++	mutex_lock(&ref_dump_mutex);
++	cursor = ref_dump_find(addr);
++	if (cursor) {
++		ref_dump_info_delete(&cursor->info);
++		hash_del(&cursor->node);
++	}
++	mutex_unlock(&ref_dump_mutex);
++}
++
++void ref_dump_inc(void *addr)
++{
++	struct ref_dump_event event = ref_dump_make_event(REF_DUMP_EVENT_INC);
++	struct ref_dump_event *event_target;
++
++	mutex_lock(&ref_dump_mutex);
++	struct ref_dump_node *new_node = ref_dump_find_or_create(addr);
++
++	if (new_node) {
++		new_node->info.ptr = addr;
++		event_target = ref_dump_node_add_event(new_node);
++		if (event_target == NULL) {
++			BUG();
++		}
++		*event_target = event;
++	}
++
++	mutex_unlock(&ref_dump_mutex);
++}
++
++void ref_dump_inc_regs(struct pt_regs *regs, int nth_arg)
++{
++	struct ref_dump_event event =
++		ref_dump_make_event_regs(REF_DUMP_EVENT_INC, regs);
++	struct ref_dump_event *event_target;
++	void *addr = (void *)regs_get_kernel_argument(regs, nth_arg);
++
++	mutex_lock(&ref_dump_mutex);
++	struct ref_dump_node *new_node = ref_dump_find_or_create(addr);
++
++	if (new_node) {
++		new_node->info.ptr = addr;
++		event_target = ref_dump_node_add_event(new_node);
++		*event_target = event;
++	}
++}
++
++void ref_dump_dec(void *addr)
++{
++	struct ref_dump_event event = ref_dump_make_event(REF_DUMP_EVENT_DEC);
++	struct ref_dump_event *event_target;
++
++	mutex_lock(&ref_dump_mutex);
++	struct ref_dump_node *new_node = ref_dump_find_or_create(addr);
++	if (new_node) {
++		new_node->info.ptr = addr;
++		event_target = ref_dump_node_add_event(new_node);
++		*event_target = event;
++	}
++
++	mutex_unlock(&ref_dump_mutex);
++}
++
++void ref_dump_dec_regs(struct pt_regs *regs, int nth_arg)
++{
++	struct ref_dump_event event =
++		ref_dump_make_event_regs(REF_DUMP_EVENT_DEC, regs);
++	struct ref_dump_event *event_target;
++	void *addr = (void *)regs_get_kernel_argument(regs, nth_arg);
++
++	mutex_lock(&ref_dump_mutex);
++	struct ref_dump_node *new_node = ref_dump_find_or_create(addr);
++
++	if (new_node) {
++		new_node->info.ptr = addr;
++		event_target = ref_dump_node_add_event(new_node);
++		*event_target = event;
++	}
++}
++
++void ref_dump_all(void)
++{
++	int bkt = 0;
++	struct hlist_node *tmp;
++	struct ref_dump_node *cursor;
++	mutex_lock(&ref_dump_mutex);
++	hash_for_each_safe(ref_dump_hashtable, bkt, tmp, cursor, node) {
++		ref_dump_node_info(&cursor->info);
++	}
++	mutex_unlock(&ref_dump_mutex);
++}
++
++void ref_dump_addr(void *addr)
++{
++	mutex_lock(&ref_dump_mutex);
++	struct ref_dump_node *node = ref_dump_find(addr);
++	if (node != NULL) {
++		ref_dump_node_info(&node->info);
++	}
++	mutex_unlock(&ref_dump_mutex);
++}
++
++void ref_dump_purge(void)
++{
++	int bkt = 0;
++	struct hlist_node *tmp;
++	struct ref_dump_node *cursor;
++	mutex_lock(&ref_dump_mutex);
++	hash_for_each_safe(ref_dump_hashtable, bkt, tmp, cursor, node) {
++		ref_dump_info_delete(&cursor->info);
++		hash_del(&cursor->node);
++		kfree(cursor);
++	}
++	mutex_unlock(&ref_dump_mutex);
++}
++#endif
++
++#ifdef CONFIG_REF_DUMP_RBTREE
++
++struct rb_ref_dump_node {
++	struct rb_node node;
++	struct ref_dump_node_info info;
++};
++
++struct rb_root root = RB_ROOT;
++
++static struct rb_ref_dump_node *__attribute__((unused))
++find_or_create_rbnode(void *addr)
++{
++	struct rb_node **new = &root.rb_node, *parent = NULL;
++	struct rb_ref_dump_node *rnode;
++	while (*new) {
++		parent = *new;
++		rnode = rb_entry_safe(parent, struct rb_ref_dump_node, node);
++		if (rnode->info.ptr < addr)
++			new = &((*new)->rb_left);
++		else if (rnode->info.ptr > addr)
++			new = &((*new)->rb_right);
++		else
++			return rnode;
++	}
++	struct rb_ref_dump_node *node =
++		kmalloc(sizeof(struct rb_ref_dump_node), GFP_KERNEL);
++	if (node == NULL)
++		return NULL;
++	ref_dump_node_info_init_events(&node->info);
++	rb_link_node(&node->node, parent, new);
++	rb_insert_color(&node->node, &root);
++	return node;
++}
++
++static struct rb_ref_dump_node *__attribute__((unused)) find_rbnode(void *addr)
++{
++	struct rb_node **new = &root.rb_node, *parent = NULL;
++	struct rb_ref_dump_node *rnode;
++	while (*new) {
++		parent = *new;
++		rnode = rb_entry_safe(*new, struct rb_ref_dump_node, node);
++		if (rnode->info.ptr < addr)
++			new = &((*new)->rb_left);
++		else if (rnode->info.ptr > addr)
++			new = &((*new)->rb_right);
++		else
++			return rnode;
++	}
++	return NULL;
++}
++
++void ref_dump_register(void *addr, int offset)
++{
++	atomic_t *counter_at = (atomic_t *)(((char *)addr) + offset);
++	struct ref_dump_event event = ref_dump_make_event(
++		REF_DUMP_EVENT_ALLOC, atomic_read(counter_at));
++	struct ref_dump_event *event_target;
++
++	mutex_lock(&ref_dump_mutex);
++	struct rb_ref_dump_node *node = find_or_create_rbnode(addr);
++	if (node) {
++		node->info.ptr = addr;
++		event_target = ref_dump_node_info_add_event(&node->info);
++		if (event_target)
++			*event_target = event;
++	}
++	mutex_unlock(&ref_dump_mutex);
++}
++
++void ref_dump_register_regs(struct pt_regs *regs, int nth_arg, int offset)
++{
++	void *addr = (void *)regs_get_kernel_argument(regs, nth_arg);
++	atomic_t *counter_at = (atomic_t *)(((char *)addr) + offset);
++	struct ref_dump_event event = ref_dump_make_event_regs(
++		REF_DUMP_EVENT_ALLOC, regs, atomic_read(counter_at));
++	struct ref_dump_event *event_target;
++
++	mutex_lock(&ref_dump_mutex);
++	struct rb_ref_dump_node *node = find_or_create_rbnode(addr);
++	if (node) {
++		node->info.ptr = addr;
++		event_target = ref_dump_node_info_add_event(&node->info);
++		if (event_target)
++			*event_target = event;
++	}
++	mutex_unlock(&ref_dump_mutex);
++}
++
++void ref_dump_inc(void *addr, int offset)
++{
++	atomic_t *counter_at = (atomic_t *)(((char *)addr) + offset);
++	struct ref_dump_event event = ref_dump_make_event(
++		REF_DUMP_EVENT_INC, atomic_read(counter_at));
++	struct ref_dump_event *event_target;
++
++	mutex_lock(&ref_dump_mutex);
++	struct rb_ref_dump_node *node = find_or_create_rbnode(addr);
++	if (node) {
++		node->info.ptr = addr;
++		event_target = ref_dump_node_info_add_event(&node->info);
++		if (event_target)
++			*event_target = event;
++	}
++	mutex_unlock(&ref_dump_mutex);
++}
++
++void ref_dump_inc_regs(struct pt_regs *regs, int nth_arg, int offset)
++{
++	void *addr = (void *)regs_get_kernel_argument(regs, nth_arg);
++	atomic_t *counter_at = (atomic_t *)(((char *)addr) + offset);
++	struct ref_dump_event event = ref_dump_make_event_regs(
++		REF_DUMP_EVENT_INC, regs, atomic_read(counter_at));
++	struct ref_dump_event *event_target;
++
++	mutex_lock(&ref_dump_mutex);
++	struct rb_ref_dump_node *node = find_or_create_rbnode(addr);
++	if (node) {
++		node->info.ptr = addr;
++		event_target = ref_dump_node_info_add_event(&node->info);
++		if (event_target)
++			*event_target = event;
++	}
++	mutex_unlock(&ref_dump_mutex);
++}
++
++void ref_dump_dec(void *addr, int offset)
++{
++	atomic_t *counter_at = (atomic_t *)(((char *)addr) + offset);
++	struct ref_dump_event event = ref_dump_make_event(
++		REF_DUMP_EVENT_DEC, atomic_read(counter_at));
++	struct ref_dump_event *event_target;
++
++	mutex_lock(&ref_dump_mutex);
++	struct rb_ref_dump_node *node = find_or_create_rbnode(addr);
++	if (node) {
++		node->info.ptr = addr;
++		event_target = ref_dump_node_info_add_event(&node->info);
++		if (event_target)
++			*event_target = event;
++	}
++	mutex_unlock(&ref_dump_mutex);
++}
++
++void ref_dump_dec_regs(struct pt_regs *regs, int nth_arg, int offset)
++{
++	void *addr = (void *)regs_get_kernel_argument(regs, nth_arg);
++	atomic_t *counter_at = (atomic_t *)(((char *)addr) + offset);
++	struct ref_dump_event event = ref_dump_make_event(
++		REF_DUMP_EVENT_INC, atomic_read(counter_at));
++	struct ref_dump_event *event_target;
++
++	mutex_lock(&ref_dump_mutex);
++	struct rb_ref_dump_node *node = find_or_create_rbnode(addr);
++	if (node) {
++		node->info.ptr = addr;
++		event_target = ref_dump_node_info_add_event(&node->info);
++		if (event_target)
++			*event_target = event;
++	}
++	mutex_unlock(&ref_dump_mutex);
++}
++
++void ref_dump_delete(void *addr, int offset)
++{
++#ifdef RD_DELETE_STRATEGY_EVENT
++	atomic_t *counter_at = (atomic_t *)(((char *)addr) + offset);
++	struct ref_dump_event event = ref_dump_make_event(
++		REF_DUMP_EVENT_FREE, atomic_read(counter_at));
++	struct ref_dump_event *event_target;
++
++	mutex_lock(&ref_dump_mutex);
++	struct rb_ref_dump_node *node = find_or_create_rbnode(addr);
++	if (node) {
++		node->info.ptr = addr;
++		event_target = ref_dump_node_info_add_event(&node->info);
++		if (event_target)
++			*event_target = event;
++	}
++	mutex_unlock(&ref_dump_mutex);
++#else
++	mutex_lock(&ref_dump_mutex);
++	struct rb_ref_dump_node *node = find_rbnode(addr);
++	if (node) {
++		ref_dump_info_delete(&node->info);
++		rb_erase(&node->node, &root);
++	}
++	mutex_unlock(&ref_dump_mutex);
++#endif
++}
++
++void ref_dump_delete_regs(struct pt_regs *regs, int nth_arg, int offset)
++{
++#ifdef RD_DELETE_STRATEGY_EVENT
++	void *addr = (void *)regs_get_kernel_argument(regs, nth_arg);
++	atomic_t *counter_at = (atomic_t *)(((char *)addr) + offset);
++	struct ref_dump_event event = ref_dump_make_event(
++		REF_DUMP_EVENT_FREE, atomic_read(counter_at));
++	struct ref_dump_event *event_target;
++
++	mutex_lock(&ref_dump_mutex);
++	struct rb_ref_dump_node *node = find_or_create_rbnode(addr);
++	if (node) {
++		node->info.ptr = addr;
++		event_target = ref_dump_node_info_add_event(&node->info);
++		if (event_target)
++			*event_target = event;
++	}
++	mutex_unlock(&ref_dump_mutex);
++#else
++	mutex_lock(&ref_dump_mutex);
++	struct rb_ref_dump_node *node = find_rbnode(addr);
++	if (node) {
++		ref_dump_info_delete(&node->info);
++		rb_erase(&node->node, &root);
++	}
++	mutex_unlock(&ref_dump_mutex);
++#endif
++}
++
++void ref_dump_addr(void *addr)
++{
++	mutex_lock(&ref_dump_mutex);
++	struct rb_ref_dump_node *node = find_rbnode(addr);
++	if (node) {
++		ref_dump_node_info(&node->info);
++	}
++	mutex_unlock(&ref_dump_mutex);
++}
++
++void ref_dump_all(void)
++{
++	mutex_lock(&ref_dump_mutex);
++	struct rb_node *node;
++	for (node = rb_first(&root); node; node = rb_next(node)) {
++		ref_dump_node_info(
++			&rb_entry_safe(node, struct rb_ref_dump_node, node)
++				 ->info);
++	}
++	mutex_unlock(&ref_dump_mutex);
++}
++
++void ref_dump_init(void)
++{
++	stack_depot_init();
++}
++
++void ref_dump_purge(void)
++{
++	mutex_lock(&ref_dump_mutex);
++	struct rb_node *node;
++	for (node = rb_first(&root); node; node = rb_next(node)) {
++		ref_dump_info_delete(
++			&rb_entry_safe(node, struct rb_ref_dump_node, node)
++				 ->info);
++	}
++	mutex_unlock(&ref_dump_mutex);
++}
++
++void ref_dump_whitelist_addr(void *addr, bool enable)
++{
++	struct rb_ref_dump_node *node = find_rbnode(addr);
++	if (!node && !enable) {
++		return;
++	}
++	if (!node) {
++		node = find_or_create_rbnode(addr);
++	}
++	node->info.whitelisted = enable;
++}
++#endif
++
++#ifdef REF_DUMP_RHASHTABLE
++
++#endif //REF_DUMP_RHASHTABLE
+diff --git a/lib/test_ref_dump.c b/lib/test_ref_dump.c
+new file mode 100644
+index 000000000000..a5241de7c100
+--- /dev/null
++++ b/lib/test_ref_dump.c
+@@ -0,0 +1,277 @@
++#include "asm/kgdb.h"
++#include "asm/ptrace.h"
++#include "linux/gfp_types.h"
++#include "linux/jump_label.h"
++#include "linux/kprobes.h"
++#include "linux/panic.h"
++#include "linux/printk.h"
++#include "linux/sched/clock.h"
++#include "linux/slab.h"
++#include "linux/stddef.h"
++#include <linux/module.h>
++#include <linux/ref_dump.h>
++
++#define ALLOC_HELPER(N)                                                       \
++	static noinline void helper_alloc_##N(struct test_rd_object **object) \
++	{                                                                     \
++		static int x;                                                 \
++		x = 0;                                                        \
++		*object = kmalloc(sizeof(struct test_rd_object), GFP_KERNEL); \
++		test_rd_init(*object); \
++		ref_dump_register(*object, offsetof(struct test_rd_object, ref_count));                                   \
++		printk("Allocated object %i", N);                             \
++	}
++
++struct test_rd_object {
++	atomic_t ref_count;
++};
++
++static void test_rd_init(struct test_rd_object *o)
++{
++	atomic_set(&o->ref_count, 1);
++}
++
++static void test_rd_get(struct test_rd_object *o)
++{
++	atomic_inc(&o->ref_count);
++	ref_dump_inc(o, offsetof(struct test_rd_object, ref_count));
++}
++
++static void test_rd_put(struct test_rd_object *o)
++{
++	atomic_dec(&o->ref_count);
++	ref_dump_dec(o, offsetof(struct test_rd_object, ref_count));
++}
++
++ALLOC_HELPER(0)
++ALLOC_HELPER(1)
++ALLOC_HELPER(2)
++ALLOC_HELPER(3)
++ALLOC_HELPER(4)
++ALLOC_HELPER(5)
++ALLOC_HELPER(6)
++ALLOC_HELPER(7)
++ALLOC_HELPER(8)
++ALLOC_HELPER(9)
++// // ALLOC_OBJECT(10)
++
++void (*alloc_object_fns[10])(struct test_rd_object **) = {
++	&helper_alloc_0, &helper_alloc_1, &helper_alloc_2, &helper_alloc_3,
++	&helper_alloc_4, &helper_alloc_5, &helper_alloc_6, &helper_alloc_7,
++	&helper_alloc_8, &helper_alloc_9
++};
++
++static struct test_rd_object *objects[10];
++
++static noinline void alloc_all_objects(void)
++{
++	for (int i = 0; i < 10; i += 1) {
++		alloc_object_fns[i](&objects[i]);
++		test_rd_init(objects[i]);
++	}
++}
++
++static noinline void inc_all_objects(void) {
++	for (int i = 0; i < 10; i += 1) {
++		test_rd_get(objects[i]);
++	}
++}
++
++static noinline void dec_all_objects(void) {
++	for (int i = 0; i < 10; i += 1) {
++		test_rd_put(objects[i]);
++	}
++}
++
++static noinline void dec_all_but_one_objects(void) {
++	for (int i = 0; i < 9; i += 1) {
++		test_rd_put(objects[i]);
++	}
++}
++
++// static void bench_n_addresses_one_op(int n)
++// {
++// 	printk("bench_n_addresses_one_op(%i)", n);
++// 	bench_reset();
++// 	void **addrs = kmalloc(8 * n, GFP_KERNEL);
++// 	for (int i = 0; i < n; i += 1) {
++// 		addrs[i] = kmalloc(1, GFP_KERNEL);
++// 	}
++// 	long before = sched_clock();
++// 	for (int i = 0; i < n; i += 1) {
++// 		ref_dump_register(addrs[i]);
++// 	}
++// 	long after = sched_clock();
++// 	long time = after - before;
++// 	printk("Time: %li ns (%li ns per op)", time, time / n);
++// 	printk("Memory: %li bytes (%li bytes per addr)", bench_mem(),
++// 	       bench_mem() / n);
++// 	ref_dump_purge();
++
++// 	for (int i = 0; i < n; i += 1) {
++// 		kfree(addrs[i]);
++// 	}
++// 	kfree(addrs);
++// }
++
++// static void bench_n_ops_one_addr(int n)
++// {
++// 	printk("bench_n_ops_one_addr(%i)", n);
++// 	bench_reset();
++// 	void *addr = kmalloc(1, GFP_KERNEL);
++// 	long before = sched_clock();
++// 	for (int i = 0; i < n; i += 1) {
++// 		ref_dump_inc(addr);
++// 	}
++// 	long after = sched_clock();
++// 	long time = after - before;
++// 	printk("Time: %li ns (%li ns per op)", time, time / n);
++// 	printk("Memory: %li bytes (%li bytes per op)", bench_mem(),
++// 	       bench_mem() / n);
++// 	kfree(addr);
++// 	ref_dump_purge();
++// }
++
++// static void bench_n_addr_m_ops(int n, int m)
++// {
++// 	printk("bench_n_addr_m_ops(%i, %i)", n, m);
++// 	bench_reset();
++// 	void **addrs = kmalloc(8 * n, GFP_KERNEL);
++// 	for (int i = 0; i < n; i += 1) {
++// 		addrs[i] = kmalloc(1, GFP_KERNEL);
++// 	}
++// 	long before = sched_clock();
++// 	for (int i = 0; i < n; i += 1) {
++// 		for (int j = 0; j < m; j += 1)
++// 			ref_dump_inc(addrs[i]);
++// 	}
++// 	long after = sched_clock();
++// 	long time = after - before;
++// 	printk("Time: %li ns (%li ns per op)", time, time / n / m);
++// 	printk("Memory: %li bytes (%li bytes per op)", bench_mem(),
++// 	       bench_mem() / n / m);
++// 	for (int i = 0; i < n; i += 1) {
++// 		kfree(addrs[i]);
++// 	}
++// 	kfree(addrs);
++// 	printk("Freed.");
++// 	ref_dump_purge();
++// 	printk("Purged.");
++// }
++
++// static void bench_n_ops_one_addr_purge(int n)
++// {
++// 	printk("bench_n_ops_one_addr(%i)", n);
++// 	bench_reset();
++// 	void *addr = kmalloc(1, GFP_KERNEL);
++
++// 	for (int i = 0; i < n; i += 1) {
++// 		ref_dump_inc(addr);
++// 	}
++
++// 	kfree(addr);
++// 	long before = sched_clock();
++// 	ref_dump_purge();
++// 	long after = sched_clock();
++
++// 	long time = after - before;
++// 	printk("Time: %li ns (%li ns per op)", time, time / n);
++// 	printk("Memory: %li bytes (%li bytes per op)", bench_mem(),
++// 	       bench_mem() / n);
++// }
++
++static int __init test_ref_dump_init(void)
++{
++	ref_dump_init();
++	// bench_n_addresses_one_op(10);
++	// bench_n_addresses_one_op(100);
++	// bench_n_addresses_one_op(1000);
++	// bench_n_addresses_one_op(5000);
++	// bench_n_addresses_one_op(10000);
++	// bench_n_addresses_one_op(50000);
++	// bench_n_addresses_one_op(100000);
++	// bench_n_addresses_one_op(500000);
++
++	// bench_n_ops_one_addr(10);
++	// bench_n_ops_one_addr(100);
++	// bench_n_ops_one_addr(200);
++	// bench_n_ops_one_addr(300);
++	// bench_n_ops_one_addr(400);
++	// bench_n_ops_one_addr(500);
++	// bench_n_ops_one_addr(600);
++	// bench_n_ops_one_addr(1000);
++	// bench_n_ops_one_addr(5000);
++	// bench_n_ops_one_addr(10000);
++	// bench_n_ops_one_addr(500000);
++
++	// bench_n_addr_m_ops(100, 100);
++	// bench_n_addr_m_ops(1000, 1000);
++	// printk("here");
++	// bench_n_addr_m_ops(10000, 1000);
++	// bench_n_addr_m_ops(10000, 10000);
++	// bench_n_addr_m_ops(int n, int m);
++	// bench_n_addresses_single(500000);
++	// bench_n_addresses_single(600000);
++	// int ret = register_kprobe(&mykpr);
++	// if (ret < 0) {
++	// 	pr_err("register_kprobe failed, returned %d\n", ret);
++	// }
++
++	// testfunction();
++	printk("REF DUMP SELF-TEST...");
++	printk("Whitelist");
++	ref_dump_whitelist_set_enabled(true);
++	alloc_all_objects();
++
++	ref_dump_whitelist_addr(objects[3], true);
++	printk("Allocated all 10.");
++	// ref_dump_all();
++
++	inc_all_objects();
++	printk("Increased all 10.");
++	// ref_dump_all();
++
++	dec_all_objects();
++	printk("Decremented all 10.");
++	// ref_dump_all();
++
++	dec_all_but_one_objects();
++	printk("Decremented all but the last.");
++	ref_dump_all();
++
++	ref_dump_purge();
++
++	printk("No whitelist");
++	ref_dump_whitelist_set_enabled(false);
++	// printk("Test 1: Distinct stacktraces (10)");
++
++	alloc_all_objects();
++	printk("Allocated all 10.");
++	// ref_dump_all();
++
++	inc_all_objects();
++	printk("Increased all 10.");
++	// ref_dump_all();
++
++	dec_all_objects();
++	printk("Decremented all 10.");
++	// ref_dump_all();
++
++	dec_all_but_one_objects();
++	printk("Decremented all but the last.");
++	ref_dump_all();
++
++	struct test_rd_object *test = kmalloc(sizeof(struct test_rd_object), GFP_KERNEL);
++	printk("Test addr = %px", test);
++	test_rd_init(test);
++	ref_dump_register(test, offsetof(struct test_rd_object, ref_count));
++	test_rd_get(test);
++	test_rd_put(test);
++	ref_dump_addr(test);
++	printk("REF DUMP SELF-TEST END...");
++	kfree(test);
++	printk("%i", *(char *)test);
++	return 0;
++}
++
++module_init(test_ref_dump_init);
+diff --git a/mm/kasan/report.c b/mm/kasan/report.c
+index 7afa4feb03e1..912fcef151c3 100644
+--- a/mm/kasan/report.c
++++ b/mm/kasan/report.c
+@@ -29,6 +29,7 @@
+ #include <linux/sched/task_stack.h>
+ #include <linux/uaccess.h>
+ #include <trace/events/error_report.h>
++#include <linux/ref_dump.h>
+ 
+ #include <asm/sections.h>
+ 
+@@ -490,6 +491,7 @@ static void print_report(struct kasan_report_info *info)
+ 	} else {
+ 		dump_stack_lvl(KERN_ERR);
+ 	}
++	ref_dump_addr((void *) info->first_bad_addr);
+ }
+ 
+ static void complete_report_info(struct kasan_report_info *info)
+-- 
+2.42.0
+
